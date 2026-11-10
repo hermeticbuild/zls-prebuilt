@@ -1,0 +1,114 @@
+name: Build and release
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build with upstream ZLS and run upstream tests
+        id: build
+        env:
+          RUN_TESTS: '1'
+        run: |
+          ./build.sh
+          source release.env
+          echo "dist=dist/$ZLS_VERSION" >> "$GITHUB_OUTPUT"
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          source release.env
+          test "$RELEASE_TAG" = "$ZLS_VERSION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zls-dist
+          path: ${{ steps.build.outputs.dist }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: zls-dist
+          path: artifacts
+      - name: Verify checksums
+        working-directory: artifacts
+        run: sha256sum --check SHA256SUMS
+      - name: Attest build outputs
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: artifacts/*
+      - name: Include verification bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" artifacts/provenance.jsonl
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: attested-dist
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: attest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: attested-dist
+          path: artifacts
+      - name: Verify and publish a new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          cd artifacts
+          sha256sum --check SHA256SUMS
+          for archive in *.tar.xz; do
+            gh attestation verify "$archive" --repo "$GH_REPO" \
+              --bundle provenance.jsonl --deny-self-hosted-runners \
+              --signer-workflow "$GH_REPO/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$SOURCE_SHA"
+          done
+          # Never replace assets already pinned by downstream consumers.
+          gh release create "$RELEASE_TAG" --verify-tag --draft \
+            --title "ZLS $RELEASE_TAG" --notes "Built from the pinned upstream source and patches at $SOURCE_SHA. See BUILD-INFO.txt for inputs and provenance.jsonl for signed build provenance." \
+            ./*.tar.xz SHA256SUMS BUILD-INFO.txt provenance.jsonl
+          gh release edit "$RELEASE_TAG" --draft=false
